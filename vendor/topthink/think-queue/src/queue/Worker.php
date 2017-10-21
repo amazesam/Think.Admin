@@ -32,9 +32,11 @@ class Worker
         $job = $this->getNextJob($queue);
 
         if (!is_null($job)) {
+            Hook::listen('worker_before_process', $queue);
             return $this->process($job, $maxTries, $delay);
         }
 
+        Hook::listen('worker_before_sleep', $queue);
         $this->sleep($sleep);
 
         return ['job' => null, 'failed' => false];
@@ -92,9 +94,13 @@ class Worker
      */
     protected function logFailedJob(Job $job)
     {
-        if (Hook::listen('queue.failed', $job, null, true)) {
-            $job->delete();
-            $job->failed();
+        if (!$job->isDeleted()) {
+            try {
+                $job->delete();
+                $job->failed();
+            } finally {
+                Hook::listen('queue_failed', $job);
+            }
         }
 
         return ['job' => $job, 'failed' => true];

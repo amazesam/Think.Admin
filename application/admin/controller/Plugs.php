@@ -3,7 +3,7 @@
 // +----------------------------------------------------------------------
 // | Think.Admin
 // +----------------------------------------------------------------------
-// | 版权所有 2016~2017 广州楚才信息科技有限公司 [ http://www.cuci.cc ]
+// | 版权所有 2014~2017 广州楚才信息科技有限公司 [ http://www.cuci.cc ]
 // +----------------------------------------------------------------------
 // | 官方网站: http://think.ctolog.com
 // +----------------------------------------------------------------------
@@ -15,9 +15,7 @@
 namespace app\admin\controller;
 
 use controller\BasicAdmin;
-use library\Data;
-use library\File;
-use think\Db;
+use service\FileService;
 
 /**
  * 插件助手控制器
@@ -26,71 +24,87 @@ use think\Db;
  * @author Anyon <zoujingli@qq.com>
  * @date 2017/02/21
  */
-class Plugs extends BasicAdmin {
-
-    /**
-     * 默认检查用户登录状态
-     * @var bool
-     */
-    protected $checkLogin = false;
-
-    /**
-     * 默认检查节点访问权限
-     * @var bool
-     */
-    protected $checkAuth = false;
+class Plugs extends BasicAdmin
+{
 
     /**
      * 文件上传
+     * @return \think\response\View
      */
-    public function upfile($mode = 'one') {
+    public function upfile()
+    {
+        $uptype = $this->request->get('uptype');
+        if (!in_array($uptype, ['local', 'qiniu', 'oss'])) {
+            $uptype = sysconf('storage_type');
+        }
+        $mode = $this->request->get('mode', 'one');
         $types = $this->request->get('type', 'jpg,png');
-        $field = $this->request->get('field', 'file');
-        $this->assign('field', $field);
-        $this->assign('types', $types);
-        $this->assign('mimes', File::getMine($types));
-        $this->assign('uptype', sysconf('storage_type'));
-        $this->assign('mode', $mode);
-        return view();
+        $this->assign('mimes', FileService::getFileMine($types));
+        $this->assign('field', $this->request->get('field', 'file'));
+        return view('', ['mode' => $mode, 'types' => $types, 'uptype' => $uptype]);
     }
 
     /**
-     * 检查文件上传状态
+     * 通用文件上传
+     * @return \think\response\Json
      */
-    public function upstate() {
-        $post = $this->request->post();
-        // 组装返回数据
-        $data = [];
-        $data['uptype'] = $post['uptype'];
-        $ext = pathinfo($post['filename'], PATHINFO_EXTENSION);
-        $data['file_url'] = join('/', str_split($post['md5'], 16)) . ".{$ext}";
-        $data['token'] = $this->_getQiniuToken($data['file_url']);
-        $data['server'] = url('admin/plugs/upload');
-        // 检查文件是否已经上传
-        $fileinfo = Db::name('SystemFile')->where(['uptype' => $post['uptype'], 'md5' => $post['md5']])->find();
-        // 七牛云文件写入处理
-        if (sysconf('storage_type') === 'qiniu') {
-            $data['server'] = sysconf('storage_qiniu_is_https') ? 'https://up.qbox.me' : 'http://upload.qiniu.com';
-            if (empty($fileinfo)) {
-                $file = [];
-                $file['uptype'] = 'qiniu';
-                $file['md5'] = $post['md5'];
-                $file['real_name'] = $post['filename'];
-                $file['file_name'] = pathinfo($data['file_url'], PATHINFO_BASENAME);
-                $file['file_path'] = $data['file_url'];
-                $file['full_path'] = $data['file_url'];
-                $file['file_ext'] = $ext;
-                $file['file_url'] = $data['file_url'];
-                $file['site_url'] = (sysconf('storage_qiniu_is_https') ? 'https' : 'http') . '://' . sysconf('storage_qiniu_domain') . '/' . $data['file_url'];
-                $file['create_by'] = session('user.id');
-                Data::save('SystemFile', $file, 'md5', ['uptype' => $post['uptype']]);
+    public function upload()
+    {
+        $file = $this->request->file('file');
+        $ext = strtolower(pathinfo($file->getInfo('name'), 4));
+        $md5 = str_split($this->request->post('md5'), 16);
+        $filename = join('/', $md5) . ".{$ext}";
+        if (!in_array($ext, explode(',', strtolower(sysconf('storage_local_exts'))))) {
+            return json(['code' => 'ERROR', 'msg' => '文件上传类型受限']);
+        }
+        // 文件上传Token验证
+        if ($this->request->post('token') !== md5($filename . session_id())) {
+            return json(['code' => 'ERROR', 'msg' => '文件上传验证失败']);
+        }
+        // 文件上传处理
+        if (($info = $file->move('static' . DS . 'upload' . DS . $md5[0], $md5[1], true))) {
+            if (($site_url = FileService::getFileUrl($filename, 'local'))) {
+                return json(['data' => ['site_url' => $site_url], 'code' => 'SUCCESS', 'msg' => '文件上传成功']);
             }
         }
-        // 本地上传或文件不存在
-        if (empty($fileinfo) || ($fileinfo['uptype'] === 'local' && !file_exists($fileinfo['full_path']))) {
-            return $this->result($data, 'NOT_FOUND');
+        return json(['code' => 'ERROR', 'msg' => '文件上传失败']);
+    }
+
+    /**
+     * 文件状态检查
+     */
+    public function upstate()
+    {
+        $post = $this->request->post();
+        $filename = join('/', str_split($post['md5'], 16)) . '.' . pathinfo($post['filename'], 4);
+        // 检查文件是否已上传
+        if (($site_url = FileService::getFileUrl($filename))) {
+            $this->result(['site_url' => $site_url], 'IS_FOUND');
         }
-        return $this->result($fileinfo, 'IS_FOUND');
+        // 需要上传文件，生成上传配置参数
+        $config = ['uptype' => $post['uptype'], 'file_url' => $filename];
+        switch (strtolower($post['uptype'])) {
+            case 'qiniu':
+                $config['server'] = FileService::getUploadQiniuUrl(true);
+                $config['token'] = $this->_getQiniuToken($filename);
+                break;
+            case 'local':
+                $config['server'] = FileService::getUploadLocalUrl();
+                $config['token'] = md5($filename . session_id());
+                break;
+            case 'oss':
+                $time = time() + 3600;
+                $policyText = [
+                    'expiration' => date('Y-m-d', $time) . 'T' . date('H:i:s', $time) . '.000Z',
+                    'conditions' => [['content-length-range', 0, 1048576000]],
+                ];
+                $config['policy'] = base64_encode(json_encode($policyText));
+                $config['server'] = FileService::getUploadOssUrl();
+                $config['site_url'] = FileService::getBaseUriOss() . $filename;
+                $config['signature'] = base64_encode(hash_hmac('sha1', $config['policy'], sysconf('storage_oss_secret'), true));
+                $config['OSSAccessKeyId'] = sysconf('storage_oss_keyid');
+        }
+        $this->result($config, 'NOT_FOUND');
     }
 
     /**
@@ -98,70 +112,29 @@ class Plugs extends BasicAdmin {
      * @param string $key
      * @return string
      */
-    protected function _getQiniuToken($key) {
+    protected function _getQiniuToken($key)
+    {
+        $host = sysconf('storage_qiniu_domain');
+        $bucket = sysconf('storage_qiniu_bucket');
         $accessKey = sysconf('storage_qiniu_access_key');
         $secretKey = sysconf('storage_qiniu_secret_key');
-        $bucket = sysconf('storage_qiniu_bucket');
-        $host = sysconf('storage_qiniu_domain');
         $protocol = sysconf('storage_qiniu_is_https') ? 'https' : 'http';
-        $time = time() + 3600;
-        empty($key) && exit('param error');
         $params = [
-            "scope"      => "{$bucket}:{$key}",
-            "deadline"   => $time,
+            "scope"      => "{$bucket}:{$key}", "deadline" => 3600 + time(),
             "returnBody" => "{\"data\":{\"site_url\":\"{$protocol}://{$host}/$(key)\",\"file_url\":\"$(key)\"}, \"code\": \"SUCCESS\"}",
         ];
-        $find = array('+', '/');
-        $replace = array('-', '_');
-        $data = str_replace($find, $replace, base64_encode(json_encode($params)));
-        $sign = hash_hmac('sha1', $data, $secretKey, true);
-        return $accessKey . ':' . str_replace($find, $replace, base64_encode($sign)) . ':' . $data;
+        $data = str_replace(['+', '/'], ['-', '_'], base64_encode(json_encode($params)));
+        return $accessKey . ':' . str_replace(['+', '/'], ['-', '_'], base64_encode(hash_hmac('sha1', $data, $secretKey, true))) . ':' . $data;
     }
 
     /**
-     * 通用文件上传
-     * @return string
+     * 字体图标选择器
+     * @return \think\response\View
      */
-    public function upload() {
-        if ($this->request->isPost()) {
-            $md5s = str_split($this->request->post('md5'), 16);
-            $filepath = 'upload' . DS . array_shift($md5s);
-            $savename = array_shift($md5s);
-            if (($info = $this->request->file('file')->move($filepath, $savename, true))) {
-                $data = [];
-                $data['uptype'] = 'local';
-                $data['md5'] = $this->request->post('md5', $info->md5());
-                $data['real_name'] = $this->replacePath($info->getInfo('name'));
-                $data['file_name'] = $this->replacePath($info->getFilename());
-                $data['file_path'] = $this->replacePath($info->getPathname());
-                $data['full_path'] = $this->replacePath($info->getRealPath());
-                $data['file_ext'] = $info->getExtension();
-                $data['file_size'] = $info->getSize();
-                $data['file_url'] = $this->replacePath($filepath . '/' . $info->getSaveName());
-                $data['site_url'] = $this->replacePath(pathinfo($this->request->baseFile(true), PATHINFO_DIRNAME) . '/' . $data['file_url']);
-                $data['create_by'] = session('user.id');
-                Data::save('SystemFile', $data, 'md5', ['uptype' => 'local']);
-                return json(['data' => $data, 'code' => 'SUCCESS']);
-            }
-        }
-        return json(['code' => 'ERROR']);
-    }
-
-    /**
-     * 路径替换
-     * @param type $path
-     * @return type
-     */
-    protected function replacePath($path) {
-        return str_replace('\\', '/', $path);
-    }
-
-    /**
-     * 字体图标
-     */
-    public function icon() {
-        $this->assign('field', $this->request->get('field', 'icon'));
-        return view();
+    public function icon()
+    {
+        $field = $this->request->get('field', 'icon');
+        return view('', ['field' => $field]);
     }
 
 }

@@ -1,5 +1,9 @@
 !.gitignore
+!.gitattributes
 /.idea
 /.svn
-/runtime/
+/.git
+/runtime
+/nbproject
 /composer.lock
+/static/upload
